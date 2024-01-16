@@ -1,0 +1,297 @@
+import json
+import datetime
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from aiogram.utils import executor
+
+API_TOKEN = "API_KEY"
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+
+
+def generate_dates():
+    today = datetime.date.today()
+    dates = [today + datetime.timedelta(days=i) for i in range(5)]
+    return dates
+
+
+def generate_time_slots():
+    start_time = datetime.time(9, 0)  # начало рабочего дня
+    end_time = datetime.time(17, 30)  # конец рабочего дня
+    lunch_start = datetime.time(13, 0)  # начало времени на обед
+    lunch_end = datetime.time(14, 0)  # конец времени на обед
+
+    time_slots = []
+
+    current_time = datetime.datetime.combine(datetime.date.today(), start_time)
+    while current_time.time() <= end_time:
+        if lunch_start <= current_time.time() < lunch_end:
+            current_time += datetime.timedelta(minutes=30)
+            continue
+
+        time_slots.append(current_time.strftime("%H:%M"))
+        current_time += datetime.timedelta(minutes=30)
+
+    return time_slots
+
+
+def get_user_appointments(user_id):
+    appointments = []
+    with open("appointments.json", "r") as f:
+        for line in f:
+            data = json.loads(line)
+            if data["user_id"] == user_id:
+                appointments.append(data)
+    return appointments
+
+
+def is_time_slot_available(selected_date, selected_time):
+    lunch_start = datetime.time(13, 0)  # начало времени на обед
+    lunch_end = datetime.time(14, 0)  # конец времени на обед
+
+    with open("appointments.json", "r") as f:
+        for line in f:
+            data = json.loads(line)
+            if data["date"] == selected_date and data["time"] == selected_time:
+                return False
+
+    selected_time = datetime.datetime.strptime(selected_time, "%H:%M").time()
+    if lunch_start <= selected_time < lunch_end:
+        return False
+
+    return True
+
+
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("Записать на прием"))
+    markup.add(KeyboardButton("Мои записи"))
+
+    await message.answer("Привет! Для чего вы хотите записаться?", reply_markup=markup)
+
+
+@dp.message_handler(
+    lambda message: message.text == "Записать на прием",
+    content_types=types.ContentTypes.TEXT,
+)
+async def choose_doctor(message: types.Message):
+    user_id = message.from_user.id
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    doctors = ["Иванов И.О.", "Петров И.О.", "Сидоров И.О.", "Смирнов И.О."]
+    buttons = [
+        InlineKeyboardButton(text=doctor, callback_data=f"doctor_{doctor}")
+        for doctor in doctors
+    ]
+    keyboard.add(*buttons)
+
+    await message.answer("Выбери врача:", reply_markup=keyboard)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("doctor_"))
+async def choose_date(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    selected_doctor = call.data.split("_")[1]
+    await call.answer()
+
+    dates = generate_dates()
+
+    keyboard = InlineKeyboardMarkup(row_width=3)  # Три столбца
+    for date in dates:
+        button_text = date.strftime("%d.%m.%Y")  # Изменен формат даты
+        button_data = f"date_{selected_doctor}_{date.strftime('%d.%m.%Y')}"  # Изменен формат данных
+        keyboard.add(InlineKeyboardButton(text=button_text, callback_data=button_data))
+
+    await bot.edit_message_text(
+        chat_id=user_id,
+        message_id=call.message.message_id,
+        text=f"Выбери дату для {selected_doctor}:",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("date_"))
+async def choose_time(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    data = call.data.split("_")
+    selected_doctor = data[1]
+    selected_date = data[2]
+    await call.answer()
+
+    time_slots = generate_time_slots()
+
+    keyboard = InlineKeyboardMarkup(row_width=3)  # Три столбца
+    buttons = [
+        InlineKeyboardButton(
+            text=time_slot,
+            callback_data=f"time_{selected_doctor}_{selected_date}_{time_slot}",
+        )
+        for time_slot in time_slots
+        if is_time_slot_available(selected_date, time_slot)
+    ]
+    keyboard.add(*buttons)
+
+    # Добавляем кнопку "Назад"
+    keyboard.add(
+        InlineKeyboardButton(
+            text="Назад", callback_data=f"back_{selected_doctor}_{selected_date}"
+        )
+    )
+
+    await bot.edit_message_text(
+        chat_id=user_id,
+        message_id=call.message.message_id,
+        text="Выбери время:",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("time_"))
+async def confirm_appointment(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    data = call.data.split("_")
+    selected_doctor = data[1]
+    selected_date = data[2]
+    selected_time = data[3]
+    await call.answer()
+
+    if is_time_slot_available(selected_date, selected_time):
+        # Сохранение записи в JSON файле с новым форматом даты
+        user_data = {
+            "user_id": user_id,
+            "doctor": selected_doctor,
+            "date": selected_date,
+            "time": selected_time,
+        }
+        with open("appointments.json", "a") as f:
+            json.dump(user_data, f, ensure_ascii=False)
+            f.write("\n")
+
+        await bot.send_message(
+            user_id,
+            f"Запись на прием к {selected_doctor} {selected_date} в {selected_time} успешно создана!",
+        )
+
+        # Скрыть клавиатуру после выбора времени
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Спасибо за запись! Ваша запись подтверждена.",
+        )
+    else:
+        await bot.send_message(
+            user_id, f"Извините, время {selected_date} в {selected_time} уже занято."
+        )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("back_"))
+async def back_to_doctors(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    data = call.data.split("_")
+    selected_doctor = data[1]
+    selected_date = data[2]
+    await call.answer()
+
+    dates = generate_dates()
+
+    keyboard = InlineKeyboardMarkup(row_width=3)  # Три столбца
+    for date in dates:
+        button_text = date.strftime("%d.%m.%Y")  # Изменен формат даты
+        button_data = f"date_{selected_doctor}_{date.strftime('%d.%m.%Y')}"  # Изменен формат данных
+        keyboard.add(InlineKeyboardButton(text=button_text, callback_data=button_data))
+
+    await bot.edit_message_text(
+        chat_id=user_id,
+        message_id=call.message.message_id,
+        text=f"Выбери дату для {selected_doctor}:",
+        reply_markup=keyboard,
+    )
+
+
+@dp.message_handler(
+    lambda message: message.text == "Мои записи", content_types=types.ContentTypes.TEXT
+)
+async def show_user_appointments(message: types.Message):
+    user_id = message.from_user.id
+    appointments = get_user_appointments(user_id)
+
+    if appointments:
+        keyboard = InlineKeyboardMarkup(row_width=1)  # Одна колонка
+        for appointment in appointments:
+            cancel_button = InlineKeyboardButton(
+                text=f"{appointment['doctor']}, {appointment['date']} в {appointment['time']} ❌",
+                callback_data=f"cancel_{appointment['date']}_{appointment['time']}",
+            )
+            keyboard.add(cancel_button)
+
+        await message.answer("Твои записи на прием:", reply_markup=keyboard)
+    else:
+        response = "У тебя нет записей на прием."
+        await message.answer(response)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
+async def cancel_appointment(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    appointment_data = call.data.split("_")[1:]
+    selected_date = appointment_data[0]
+    selected_time = appointment_data[1]
+    await call.answer()
+
+    with open("appointments.json", "r") as f:
+        lines = f.readlines()
+
+    with open("appointments.json", "w") as f:
+        for line in lines:
+            data = json.loads(line)
+            if (
+                data["user_id"] == user_id
+                and data["date"] == selected_date
+                and data["time"] == selected_time
+            ):
+                await bot.send_message(
+                    user_id, f"Запись на {selected_date} в {selected_time} отменена."
+                )
+            else:
+                f.write(json.dumps(data) + "\n")
+
+    # Обновление Inline клавиатуры после отмены записи
+    appointments = get_user_appointments(user_id)
+    if appointments:
+        keyboard = InlineKeyboardMarkup(row_width=1)  # Одна колонка
+        for appointment in appointments:
+            cancel_button = InlineKeyboardButton(
+                text=f"{appointment['doctor']}, {appointment['date']} в {appointment['time']} ❌",
+                callback_data=f"cancel_{appointment['date']}_{appointment['time']}",
+            )
+            keyboard.add(cancel_button)
+
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Твои записи на прием:",
+            reply_markup=keyboard,
+        )
+    else:
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="У тебя нет записей на прием.",
+        )
+
+
+if __name__ == "__main__":
+    from aiogram import executor
+
+    executor.start_polling(dp, skip_updates=True)
